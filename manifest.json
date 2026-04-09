@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "clip.md",
+  "version": "0.1.0",
+  "description": "Clip web pages to Markdown. Twitter/X, LessWrong, Substack, and more.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "contextMenus",
+    "clipboardWrite",
+    "offscreen"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "clip.md — Clip page to Markdown"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "commands": {
+    "clip-page": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+M",
+        "mac": "MacCtrl+Shift+M"
+      },
+      "description": "Clip current page to clipboard as Markdown"
+    }
+  },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["trigger.js"],
+    "run_at": "document_idle"
+  }],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
