@@ -61,6 +61,6 @@ extractors/            Site-specific extractors
 ## Limitations
 
 - X thread unrolling takes a few seconds (scrolls the page, restores position after)
-- MathJax v3 on non-LW sites: source LaTeX is consumed by the renderer, so you get Unicode approximations (`𝐽_𝑚 = 𝑝_𝑚 ⋅ 𝑠_𝑚`) instead of raw `$J_m = p_m \cdot s_m$`
+- MathJax v3 on non-LW sites: source LaTeX is consumed by the renderer, so we reconstruct it from the DOM (`$J_{m} = p_{m} \cdot s_{m}$`). Close but not identical to the original source.
 - Card links from X use t.co redirects (they work, but the URL is shortened)
 - Keyboard shortcut may not work in Arc (use toolbar icon instead)
