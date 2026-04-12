@@ -73,11 +73,33 @@ function todayISO() {
   return new Date().toISOString().split('T')[0];
 }
 
-// Attach utilities to ClipMD namespace
+function waitForMutation(target, { predicate = () => true, timeoutMs = 2000, observe = { childList: true, subtree: true, characterData: true } } = {}) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const done = () => {
+      if (resolved) return;
+      resolved = true;
+      observer.disconnect();
+      clearTimeout(timer);
+      resolve();
+    };
+    if (predicate()) { resolve(); return; }
+    const observer = new MutationObserver(() => { if (predicate()) done(); });
+    observer.observe(target, observe);
+    const timer = setTimeout(done, timeoutMs);
+  });
+}
+
+function cloneChildrenInto(target, source) {
+  for (const node of source.childNodes) target.appendChild(node.cloneNode(true));
+}
+
 window.ClipMD.getCanonicalUrl = getCanonicalUrl;
 window.ClipMD.getBestImageSrc = getBestImageSrc;
 window.ClipMD.flattenInline = flattenInline;
 window.ClipMD.todayISO = todayISO;
+window.ClipMD.waitForMutation = waitForMutation;
+window.ClipMD.cloneChildrenInto = cloneChildrenInto;
 
 // --- Run lock: prevent double-fire from key repeat ---
 

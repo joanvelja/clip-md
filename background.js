@@ -45,6 +45,8 @@ async function injectAndClip(tabId, mode) {
         'extractors/twitter-thread.js',
         'extractors/lesswrong.js',
         'extractors/substack.js',
+        'extractors/claude-conversation.js',
+        'extractors/chatgpt-conversation.js',
         'extractors/generic.js',
         'toast.js',
         'content.js'
