@@ -1,98 +1,127 @@
-// background.js — ClipMD service worker (MV3)
-// All listeners registered synchronously at top level.
+// background.js — clip.md service worker (MV3). Listeners registered synchronously at top level.
+//
+// Clip pipeline, one direction:
+//   stamp MathJax v3 sources (page world) → inject libs → executeScript(ClipMD.clip) returns
+//   { ok, markdown } → offscreen clipboard write → toast. Failures surface as a toast and a
+//   "!" badge + tooltip (the badge covers pages where no script can run, e.g. chrome://).
+
+importScripts('inject-files.js');  // self.CLIPMD_FILES
+
+const DEFAULT_TITLE = 'clip.md — Clip page to Markdown';
 
 chrome.runtime.onInstalled.addListener(async () => {
-  chrome.contextMenus.create({
-    id: 'clip-selection',
-    title: 'Clip selection as Markdown',
-    contexts: ['selection']
-  });
-  // Close stale offscreen documents from previous version
-  const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-  if (existing.length > 0) {
-    await chrome.offscreen.closeDocument();
-  }
+  await chrome.contextMenus.removeAll();
+  chrome.contextMenus.create({ id: 'clip-selection', title: 'Clip selection as Markdown', contexts: ['selection'] });
 });
 
-chrome.commands.onCommand.addListener(async (command) => {
-  if (command === 'clip-page') {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab) await injectAndClip(tab.id, 'full');
-  }
+chrome.commands.onCommand.addListener(async (command, tab) => {
+  // Dev loop: re-read the unpacked extension from disk. Keyboard-only, so pages can't trigger it.
+  if (command === 'reload-extension') return chrome.runtime.reload();
+  if (command !== 'clip-page') return;
+  const target = tab ?? (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+  if (target) await clipTab(target.id, 'full');
 });
 
-// Toolbar icon click also triggers full-page clip
-chrome.action.onClicked.addListener(async (tab) => {
-  await injectAndClip(tab.id, 'full');
+chrome.action.onClicked.addListener((tab) => clipTab(tab.id, 'full'));
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === 'clip-selection') clipTab(tab.id, 'selection');
 });
 
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId === 'clip-selection') {
-    await injectAndClip(tab.id, 'selection');
-  }
-});
-
-async function injectAndClip(tabId, mode) {
+async function clipTab(tabId, mode) {
+  setStatus(tabId, '…');
+  let result;
   try {
+    result = await runClip(tabId, mode);
+  } catch (err) {
+    console.error('[clip.md]', err);
+    setStatus(tabId, '!', 'clip.md failed: ' + err.message);
+    await notify(tabId, 'clip.md failed: ' + err.message, 6000);
+    return;
+  }
+  setStatus(tabId, '', DEFAULT_TITLE);
+  const n = result.warnings.length;
+  await notify(tabId, `Clipped: ${result.title}` + (n ? ` — ${n} warning${n > 1 ? 's' : ''} (see clip_warnings)` : ''), n ? 5000 : 2000);
+}
+
+// Throws on any failure; resolves only once the markdown is on the clipboard.
+async function runClip(tabId, mode) {
+  await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: stampMathJaxSources });
+  await chrome.scripting.executeScript({ target: { tabId }, files: self.CLIPMD_FILES });
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (m) => window.ClipMD.clip(m),
+    args: [mode],
+  });
+  const result = injection?.result;
+  if (!result) throw new Error('clip script returned nothing');
+  if (!result.ok) throw new Error(result.error);
+  await writeClipboard(result.markdown);
+  return result;
+}
+
+// Runs in the page's main world: MathJax v3/v4 keep each formula's source TeX in their
+// internal math list, invisible to the isolated world. Stamp it onto the rendered node.
+function stampMathJaxSources() {
+  const list = window.MathJax?.startup?.document?.math;
+  if (!list) return 0;
+  let n = 0;
+  for (const item of list) {
+    const node = item.typesetRoot;
+    if (node?.setAttribute && typeof item.math === 'string') {
+      node.setAttribute('data-clipmd-tex', item.math);
+      node.setAttribute('data-clipmd-display', String(!!item.display));
+      n++;
+    }
+  }
+  return n;
+}
+
+// --- status UI: best effort. The tab may have closed or forbid scripts; that is logged,
+// never mistaken for (or allowed to mask) the clip's own outcome. ---
+
+function setStatus(tabId, text, title) {
+  Promise.all([
+    chrome.action.setBadgeText({ tabId, text }),
+    title && chrome.action.setTitle({ tabId, title }),
+  ]).catch((err) => console.error('[clip.md] badge update failed:', err));
+}
+
+async function notify(tabId, message, duration) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['toast.js'] });
     await chrome.scripting.executeScript({
       target: { tabId },
-      files: [
-        'lib/turndown.min.js',
-        'lib/readability.min.js',
-        'lib/latex.js',
-        'lib/yaml.js',
-        'extractors/twitter-article.js',
-        'extractors/twitter-thread.js',
-        'extractors/lesswrong.js',
-        'extractors/substack.js',
-        'extractors/claude-conversation.js',
-        'extractors/chatgpt-conversation.js',
-        'extractors/generic.js',
-        'toast.js',
-        'content.js'
-      ]
+      func: (msg, ms) => window.ClipMD.showToast(msg, ms),
+      args: [message, duration],
     });
-    await chrome.tabs.sendMessage(tabId, { action: 'clip', mode });
   } catch (err) {
-    console.error('[clip.md] injectAndClip failed:', err);
-    // Surface error to user via injected toast (best-effort)
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (msg) => {
-          if (window.ClipMD?.showToast) window.ClipMD.showToast(msg, 3000);
-        },
-        args: ['Clip failed: ' + err.message]
-      });
-    } catch (_) { /* tab may not support injection (chrome:// etc) */ }
+    console.error('[clip.md] toast failed:', err);
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'trigger-clip') {
-    injectAndClip(sender.tab.id, msg.mode || 'full');
-    return false;
-  }
-  if (msg.action === 'copy') {
-    handleCopy(msg.text).then(sendResponse);
-    return true;
-  }
-});
+// --- clipboard via offscreen document (service workers have no clipboard) ---
 
-async function handleCopy(text) {
-  const existingContexts = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT']
+let offscreenLock = Promise.resolve();
+
+function ensureOffscreen() {
+  // Serialized: two concurrent clips would both see "no document" and both try to create one.
+  const ready = offscreenLock.then(async () => {
+    const existing = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+    if (!existing.length) {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: ['CLIPBOARD'],
+        justification: 'Write clipped markdown to the clipboard',
+      });
+    }
   });
-  if (existingContexts.length === 0) {
-    await chrome.offscreen.createDocument({
-      url: 'offscreen.html',
-      reasons: ['CLIPBOARD'],
-      justification: 'Write clipped markdown to clipboard'
-    });
-  }
-  const result = await chrome.runtime.sendMessage({
-    action: 'clipboard-write',
-    text
-  });
-  return result;
+  offscreenLock = ready.catch(() => {});  // keep the chain usable; callers still see the rejection
+  return ready;
+}
+
+async function writeClipboard(text) {
+  await ensureOffscreen();
+  const res = await chrome.runtime.sendMessage({ action: 'clipboard-write', text });
+  if (!res?.success) throw new Error(res?.error || 'offscreen document did not answer');
 }

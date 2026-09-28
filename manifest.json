@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "clip.md",
-  "version": "0.1.0",
-  "description": "Clip web pages to Markdown. Twitter/X, LessWrong, Substack, and more.",
+  "version": "0.2.0",
+  "description": "Clip web pages to Markdown: Claude & ChatGPT conversations, X threads, LessWrong (with comments), Substack, and more.",
   "permissions": [
     "activeTab",
     "scripting",
@@ -24,13 +24,15 @@
         "mac": "MacCtrl+Shift+M"
       },
       "description": "Clip current page to clipboard as Markdown"
+    },
+    "reload-extension": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Period",
+        "mac": "MacCtrl+Shift+Period"
+      },
+      "description": "Reload clip.md from disk (development)"
     }
   },
-  "content_scripts": [{
-    "matches": ["<all_urls>"],
-    "js": ["trigger.js"],
-    "run_at": "document_idle"
-  }],
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

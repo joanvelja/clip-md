@@ -1,76 +1,50 @@
 (function() {
-// extractors/substack.js — Substack extractor (supports custom domains)
+// extractors/substack.js — Substack posts (incl. custom domains) via the publication's
+// post API, which returns the source HTML regardless of how the page rendered.
 
-window.ClipMD = window.ClipMD || { extractors: {} };
-window.ClipMD.extractors = window.ClipMD.extractors || {};
+const ClipMD = window.ClipMD;
+const POST_PATH = /^\/p\/([^/?#]+)/;
 
-window.ClipMD.extractors.substack = {
-  canHandle() {
-    let score = 0;
-    if (document.querySelector('.body.markup')) score++;
-    if (document.querySelector('.single-post')) score++;
-    if (document.querySelector('meta[content*="Substack"]')) score++;
-    if (document.querySelector('link[href*="substackcdn"]')) score++;
-    try { if (window.__NEXT_DATA__?.props?.pageProps?.post) score++; } catch (e) {}
-    if (document.querySelector('meta[property="article:publisher"][content*="substack"]')) score++;
-    return score >= 2;
-  },
+function isSubstack() {
+  return location.hostname.endsWith('.substack.com') ||
+    !!document.querySelector('link[href*="substackcdn.com"], script[src*="substackcdn.com"]');
+}
 
-  priority: 20,
+ClipMD.extractors.substack = {
+  id: 'substack',
+  matches: () => POST_PATH.test(location.pathname) && isSubstack(),
 
   async extract() {
-    const body = document.querySelector('.body.markup') || document.querySelector('.available-content');
-    if (!body) return null;
-
-    // Title: h1 with post-title class
-    let title = '';
-    const h1s = document.querySelectorAll('h1');
-    for (const h1 of h1s) {
-      if (h1.className.includes('post-title')) {
-        title = h1.textContent.trim();
-        break;
-      }
+    const slug = POST_PATH.exec(location.pathname)[1];
+    const resp = await fetch(`/api/v1/posts/${slug}`);
+    if (!resp.ok) throw new Error(`post API HTTP ${resp.status} for ${slug}`);
+    const post = await resp.json();
+    if (post.body_html == null) {
+      throw new Error(`no body in API response (audience: ${post.audience}) — paywalled for this account?`);
     }
-    // Fallback: first substantial h1
-    if (!title) {
-      for (const h1 of h1s) {
-        const text = h1.textContent.trim();
-        if (text.length > 10) { title = text; break; }
-      }
+    const warnings = [];
+    // Inert document: parsing here fetches no images and runs nothing.
+    const body = new DOMParser().parseFromString(post.body_html, 'text/html').body;
+    // Non-subscribers get a truncated preview in body_html. Full bodies measured 0.97–1.26×
+    // the API's wordcount; a paywall preview was ~0.2×.
+    const words = body.textContent.split(/\s+/).filter(Boolean).length;
+    if (post.audience !== 'everyone' && post.wordcount > 0 && words < 0.5 * post.wordcount) {
+      throw new Error(`API returned a paywall preview (${words} of ~${post.wordcount} words, audience: ${post.audience})`);
     }
-    // Fallback: parse document.title
-    if (!title) {
-      title = document.title.replace(/\s*[-–]\s*by\s+.+$/, '').trim();
-    }
-
-    // Author
-    const authorMeta = document.querySelector('meta[name="author"]');
-    let author = authorMeta?.content || '';
-    if (!author) {
-      const byline = document.querySelector('.byline, [class*="byline"], a[class*="profile"]');
-      author = byline?.textContent?.trim() || '';
-    }
-
-    // Date
-    const timeEl = document.querySelector('time[datetime]');
-    const date = timeEl?.getAttribute('datetime')?.split('T')[0]
-      || window.ClipMD.todayISO();
-
-    // Content clone
-    const content = body.cloneNode(true);
-
-    // Paywall detection
-    const hasPaywall = !!document.querySelector('[class*="paywall"]');
 
     return {
-      title,
-      author,
-      date,
-      type: 'substack',
-      url: window.ClipMD.getCanonicalUrl(),
-      meta: { paywall: hasPaywall || undefined },
-      content
+      meta: {
+        title: post.title,
+        url: post.canonical_url || ClipMD.getCanonicalUrl(),
+        author: (post.publishedBylines || []).map((b) => b.name).join(', ') || undefined,
+        date: post.post_date ? ClipMD.isoDate(post.post_date) : undefined,
+        type: 'substack',
+        subtitle: post.subtitle || undefined,
+        audience: post.audience,
+      },
+      markdown: ClipMD.htmlToMarkdown(body, warnings),
+      warnings,
     };
-  }
+  },
 };
 })();
