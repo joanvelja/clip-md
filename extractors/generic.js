@@ -1,54 +1,48 @@
 (function() {
-// extractors/generic.js — fallback extractor using Readability
+// extractors/generic.js — Readability, for pages no site extractor claims.
 
-window.ClipMD = window.ClipMD || { extractors: {} };
-window.ClipMD.extractors = window.ClipMD.extractors || {};
+const ClipMD = window.ClipMD;
 
-window.ClipMD.extractors.generic = {
-  canHandle: () => true,
-  priority: 0,
+ClipMD.extractors.generic = {
+  id: 'generic',
+  matches: () => true,
 
-  extract: async () => {
+  async extract() {
+    const warnings = [];
     const doc = document.cloneNode(true);
+    // Before Readability: it strips the classes/scripts that identify math markup.
+    const math = ClipMD.createMathStash();
+    math.protect(doc, warnings);
+
     const article = new Readability(doc).parse();
-
-    if (!article || article.textContent.length < 200) return null;
-
+    if (!article || article.textContent.trim().length < 200) {
+      throw new Error('Readability found no article content on this page');
+    }
     const container = document.createElement('div');
     container.innerHTML = article.content;
 
     return {
-      title: article.title || document.title,
-      author: article.byline || '',
-      date: extractDate(),
-      type: 'article',
-      url: window.ClipMD.getCanonicalUrl(),
-      meta: {},
-      content: container
+      meta: {
+        title: article.title || document.title,
+        url: ClipMD.getCanonicalUrl(),
+        author: article.byline || undefined,
+        date: publishedDate(),
+        type: 'article',
+      },
+      markdown: ClipMD.markdownFromProtected(container, math),
+      warnings,
     };
-  }
+  },
 };
 
-function extractDate() {
-  const timeEl = document.querySelector('time[datetime]');
-  if (timeEl) {
-    const parsed = new Date(timeEl.getAttribute('datetime'));
-    if (!isNaN(parsed)) return formatDate(parsed);
+function publishedDate() {
+  const candidates = [
+    document.querySelector('meta[property="article:published_time"]')?.content,
+    document.querySelector('time[datetime]')?.getAttribute('datetime'),
+  ];
+  for (const c of candidates) {
+    if (c && !isNaN(new Date(c))) return ClipMD.isoDate(c);
   }
-
-  const metaDate = document.querySelector('meta[property="article:published_time"]');
-  if (metaDate && metaDate.content) {
-    const parsed = new Date(metaDate.content);
-    if (!isNaN(parsed)) return formatDate(parsed);
-  }
-
-  return window.ClipMD.todayISO();
-}
-
-function formatDate(d) {
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
+  return undefined;  // unknown — omitted from frontmatter rather than faked as today
 }
 })();

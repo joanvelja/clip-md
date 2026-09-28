@@ -1,272 +1,216 @@
 (function() {
-// extractors/twitter-thread.js — X/Twitter thread extractor
-// Scrolls the virtualized timeline, capturing tweets incrementally into a
-// de-duped Map keyed by status ID, then assembles semantic HTML for Turndown.
+// extractors/twitter-thread.js — X/Twitter threads via the web client's own GraphQL
+// endpoint (TweetDetail). The timeline DOM is virtualized and loads lazily (a 17-tweet
+// thread clipped as 1 or 8 tweets); the API returns the whole self-thread, long-form
+// text, media and quotes. Query id, feature flags and the web client's bearer are read
+// from X's own bundle at clip time, so nothing X rotates is hardcoded here.
 
-window.ClipMD = window.ClipMD || { extractors: {} };
-window.ClipMD.extractors = window.ClipMD.extractors || {};
+const ClipMD = window.ClipMD;
+const T = ClipMD.transcript;
 
-const MAX_SCROLL_ITERATIONS = 30;
-const SCROLL_WAIT_MS = 2000;
-const TIME_GAP_SEPARATOR_MS = 3 * 60 * 60 * 1000; // 3 hours
+const STATUS_PATH = /^\/([A-Za-z0-9_]+)\/status\/(\d+)/;
+const MAX_FETCHES = 40;
 
-window.ClipMD.extractors.twitterThread = {
-  canHandle() {
-    const isStatusUrl = /^https?:\/\/(x\.com|twitter\.com)\/[^/]+\/status\//.test(
-      window.location.href
-    );
-    const hasArticleView = !!document.querySelector('[data-testid="twitterArticleReadView"]');
-    const hasTweetText = !!document.querySelector('[data-testid="tweetText"]');
-    return isStatusUrl && !hasArticleView && hasTweetText;
-  },
+async function clientConfig() {
+  const src = [...document.querySelectorAll('script[src]')].map((s) => s.src)
+    .find((s) => /\/main\.[\w]+\.js$/.test(s));
+  if (!src) throw new Error('X client bundle (main.*.js) not found on the page');
+  const resp = await fetch(src);
+  if (!resp.ok) throw new Error(`X client bundle HTTP ${resp.status}`);
+  const js = await resp.text();
+  const bearer = /"(AAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%]+)"/.exec(js)?.[1];
+  const op = /queryId:"([^"]+)",operationName:"TweetDetail",operationType:"query",metadata:\{featureSwitches:\[([^\]]*)\],fieldToggles:\[([^\]]*)\]/.exec(js);
+  if (!bearer || !op) throw new Error('TweetDetail config not found in X client bundle — X changed its bundle format');
+  const flags = (list) => Object.fromEntries(list.split(',').filter(Boolean).map((s) => [s.replace(/"/g, ''), true]));
+  return { bearer: decodeURIComponent(bearer), queryId: op[1], features: flags(op[2]), fieldToggles: flags(op[3]) };
+}
 
-  priority: 40,
+async function tweetDetail(cfg, focalTweetId) {
+  const csrf = /(?:^|; )ct0=([^;]+)/.exec(document.cookie)?.[1];
+  if (!csrf) throw new Error('no ct0 cookie — not logged in to X?');
+  const variables = {
+    focalTweetId, with_rux_injections: false, rankingMode: 'Relevance', includePromotedContent: false,
+    withCommunity: true, withQuickPromoteEligibilityTweetFields: false, withBirdwatchNotes: true, withVoice: true,
+  };
+  const qs = new URLSearchParams({
+    variables: JSON.stringify(variables),
+    features: JSON.stringify(cfg.features),
+    fieldToggles: JSON.stringify(cfg.fieldToggles),
+  });
+  const resp = await fetch(`/i/api/graphql/${cfg.queryId}/TweetDetail?${qs}`, {
+    credentials: 'include',
+    headers: {
+      authorization: `Bearer ${cfg.bearer}`,
+      'x-csrf-token': csrf,
+      'x-twitter-auth-type': 'OAuth2Session',
+      'x-twitter-active-user': 'yes',
+    },
+  });
+  if (!resp.ok) throw new Error(`TweetDetail HTTP ${resp.status}`);
+  const body = await resp.json();
+  if (!body.data) throw new Error('TweetDetail: ' + (body.errors || []).map((e) => e.message).join('; '));
+  return body.data;
+}
+
+// --- normalization ---
+
+const decodeEntities = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+
+function expandUrls(text, urls) {
+  for (const u of urls || []) if (u.url && u.expanded_url) text = text.split(u.url).join(u.expanded_url);
+  return text;
+}
+
+function tweetText(t, warnings) {
+  const note = t.note_tweet?.note_tweet_results?.result;
+  if (note?.text) return decodeEntities(expandUrls(note.text, note.entity_set?.urls));
+  const L = t.legacy;
+  // display_text_range drops leading reply @mentions and the trailing media link. On this
+  // GraphQL endpoint it counts CODE POINTS of the entity-escaped text (live check: 22/22
+  // discriminating tweets with emoji/&amp;/media; the syndication API counts differently).
+  const cps = Array.from(L.full_text);
+  const [start, end] = L.display_text_range || [0, cps.length];
+  const shown = cps.slice(start, end).join('');
+  // The unit of these offsets has been misread both ways before: what gets dropped must be
+  // reply mentions (head) and media links (tail), or the slice is wrong — say so.
+  const head = cps.slice(0, start).join(''), tail = cps.slice(end).join('');
+  if (!/^(@\w+\s+)*$/.test(head) || !/^\s*(https:\/\/t\.co\/\w+\s*)*$/.test(tail)) {
+    warnings.push(`tweet ${t.rest_id}: display_text_range dropped unexpected text — check its units`);
+  }
+  return decodeEntities(expandUrls(shown, L.entities?.urls)).trim();
+}
+
+function media(t) {
+  return (t.legacy.extended_entities?.media || t.legacy.entities?.media || []).map((m) => {
+    if (m.type === 'photo') return T.image(m.ext_alt_text, `${m.media_url_https}?name=large`);
+    const mp4 = (m.video_info?.variants || [])
+      .filter((v) => v.content_type === 'video/mp4')
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    return T.tag(m.type === 'animated_gif' ? 'gif' : 'video', { url: mp4?.url, poster: m.media_url_https });
+  });
+}
+
+function card(t) {
+  const c = t.card?.legacy;
+  if (!c) return null;
+  const v = Object.fromEntries((c.binding_values || []).map((b) => [b.key, b.value?.string_value]));
+  const url = (t.legacy.entities?.urls || []).find((u) => u.url === (v.card_url || c.url))?.expanded_url || v.card_url || c.url;
+  return T.tag('card', { url, title: v.title }, v.description);
+}
+
+function unwrap(result) {
+  if (result?.__typename === 'TweetWithVisibilityResults') return result.tweet;
+  return result?.__typename === 'Tweet' ? result : null;
+}
+
+const handleOf = (t) => {
+  const user = t.core?.user_results?.result;
+  return user?.core?.screen_name ?? user?.legacy?.screen_name;
+};
+const replyToOf = (t) => t.legacy.in_reply_to_status_id_str || null;
+
+function isoTime(t) {
+  const d = new Date(t.legacy.created_at);
+  if (isNaN(d)) throw new Error(`tweet ${t.rest_id} has invalid created_at`);
+  return d.toISOString();
+}
+
+// Every Tweet in the response, raw, keyed by id. Only tweets that end up in the clip are
+// rendered (and validated) — an unrelated broken reply must not sink the thread.
+function collect(data, into) {
+  const walk = (o) => {
+    if (!o || typeof o !== 'object') return;
+    const t = unwrap(o);
+    if (t?.legacy && !into.has(t.rest_id)) into.set(t.rest_id, t);
+    for (const v of Object.values(o)) walk(v);
+  };
+  walk(data);
+  return into;
+}
+
+function renderTweet(t, warnings, tag = 'tweet') {
+  const handle = handleOf(t);
+  // Thread tweets always have one (they're matched by handle); context tweets from
+  // suspended/unavailable accounts don't.
+  if (!handle) {
+    warnings.push(`tweet ${t.rest_id}: author unavailable, text omitted`);
+    return T.tag(tag, { id: t.rest_id, unavailable: true });
+  }
+  const q = unwrap(t.quoted_status_result?.result);
+  const quoteOk = q?.legacy && handleOf(q);
+  if (t.quoted_status_result && !quoteOk) warnings.push(`tweet ${t.rest_id}: quoted tweet unavailable (deleted, protected or withheld)`);
+  return T.tag(tag, {
+    id: t.rest_id,
+    author: '@' + handle,
+    date: T.time(isoTime(t)),
+    url: `https://x.com/${handle}/status/${t.rest_id}`,
+  }, T.join([tweetText(t, warnings), ...media(t), card(t), quoteOk && renderTweet(q, warnings, 'quote')]));
+}
+
+// --- extractor ---
+
+ClipMD.extractors.twitterThread = {
+  id: 'twitter-thread',
+  matches: () => /(^|\.)(x|twitter)\.com$/.test(location.hostname) &&
+    STATUS_PATH.test(location.pathname) &&
+    !document.querySelector('[data-testid="twitterArticleReadView"]'),
 
   async extract() {
-    // --- Phase 1: Setup ---
+    const focalId = STATUS_PATH.exec(location.pathname)[2];
+    const warnings = [];
+    const cfg = await clientConfig();
+    const tweets = collect(await tweetDetail(cfg, focalId), new Map());
+    let fetches = 1;
+    const focal = tweets.get(focalId);
+    if (!focal) throw new Error(`tweet ${focalId} missing from API response (deleted or protected?)`);
+    const handle = handleOf(focal);
+    if (!handle) throw new Error(`tweet ${focalId} has no author handle`);
+    const isAuthor = (t) => handleOf(t)?.toLowerCase() === handle.toLowerCase();
 
-    const mainTweet = document.querySelector('article[data-testid="tweet"]');
-    if (!mainTweet) return null;
+    // Ancestors (root first). The unbroken run by the same author is the thread's start;
+    // anything above it is the conversation the thread replies to.
+    const ancestors = [];
+    for (let id = replyToOf(focal); id && tweets.has(id); id = replyToOf(tweets.get(id))) ancestors.unshift(tweets.get(id));
+    const missingParent = replyToOf(ancestors[0] ?? focal);
+    if (missingParent) warnings.push(`parent tweet ${missingParent} not returned by the API — the conversation above is incomplete`);
+    let split = ancestors.length;
+    while (split > 0 && isAuthor(ancestors[split - 1])) split--;
+    const context = ancestors.slice(0, split);
+    const thread = [...ancestors.slice(split), focal];
 
-    const userNameEl = mainTweet.querySelector('[data-testid="User-Name"]');
-    const authorText = userNameEl?.textContent || '';
-    const handleMatch = authorText.match(/@(\w+)/);
-    const threadAuthor = handleMatch ? handleMatch[1] : '';
-    if (!threadAuthor) return null;
-
-    const savedScrollY = window.scrollY;
-
-    // --- Phase 2: Incremental capture with de-dupe ---
-
-    const tweetMap = new Map(); // statusId → tweet data
-
-    function extractStatusId(article) {
-      // Find permalink matching the tweet author's handle to avoid retweet links.
-      // Fall back to any /status/ link with a numeric ID.
-      const links = article.querySelectorAll('a[href*="/status/"]');
-      let bestId = null;
-
-      const nameEl = article.querySelector('[data-testid="User-Name"]');
-      const nameText = nameEl?.textContent || '';
-      const tweetHandleMatch = nameText.match(/@(\w+)/);
-      const tweetHandle = tweetHandleMatch ? tweetHandleMatch[1].toLowerCase() : '';
-
-      for (const link of links) {
-        const match = link.href.match(/\/([^/]+)\/status\/(\d+)/);
-        if (!match) continue;
-        const linkHandle = match[1].toLowerCase();
-        const linkId = match[2];
-        // Prefer link matching this tweet's author
-        if (linkHandle === tweetHandle) return linkId;
-        if (!bestId) bestId = linkId;
-      }
-      return bestId;
+    // Continuation: the author's own replies to the current tail. When the loaded page has
+    // none, refocus on the tail once — long threads are paged per focal tweet.
+    let refocusedOn = focalId;
+    const inThread = new Set(thread.map((t) => t.rest_id));
+    for (;;) {
+      const tail = thread[thread.length - 1];
+      const next = [...tweets.values()]
+        .filter((t) => replyToOf(t) === tail.rest_id && isAuthor(t) && !inThread.has(t.rest_id))
+        .sort((a, b) => Date.parse(a.legacy.created_at) - Date.parse(b.legacy.created_at))[0];
+      if (next) { thread.push(next); inThread.add(next.rest_id); continue; }
+      if (refocusedOn === tail.rest_id) break;
+      if (fetches >= MAX_FETCHES) { warnings.push(`stopped after ${MAX_FETCHES} API pages — thread may continue`); break; }
+      collect(await tweetDetail(cfg, tail.rest_id), tweets);
+      fetches++;
+      refocusedOn = tail.rest_id;
     }
 
-    function harvestVisibleTweets() {
-      const articles = document.querySelectorAll('article[data-testid="tweet"]');
-      let newCount = 0;
-
-      for (const article of articles) {
-        // Skip tweets in "Discover more" / recommendation sections
-        const cell = article.closest('[data-testid="cellInnerDiv"]');
-        if (cell) {
-          let prev = cell.previousElementSibling;
-          let hitBoundary = false;
-          while (prev) {
-            const text = prev.textContent;
-            if (text.includes('Discover more') || text.includes('More Tweets') ||
-                text.includes('Sourced from')) {
-              hitBoundary = true;
-              break;
-            }
-            // Also stop if we hit another tweet (we're scanning backwards)
-            if (prev.querySelector('article[data-testid="tweet"]')) break;
-            prev = prev.previousElementSibling;
-          }
-          if (hitBoundary) continue;
-        }
-
-        const statusId = extractStatusId(article);
-        if (!statusId || tweetMap.has(statusId)) continue;
-
-        const textEl = article.querySelector('[data-testid="tweetText"]');
-        const timeEl = article.querySelector('time');
-        const nameEl = article.querySelector('[data-testid="User-Name"]');
-        const nameText = nameEl?.textContent || '';
-        const tweetHandleMatch = nameText.match(/@(\w+)/);
-        const tweetAuthor = tweetHandleMatch ? tweetHandleMatch[1] : '';
-
-        // Images
-        const photos = article.querySelectorAll('[data-testid="tweetPhoto"] img');
-        const images = Array.from(photos).map((img) => window.ClipMD.getBestImageSrc(img));
-
-        // Card links (external URL previews rendered outside tweetText)
-        const cardEl = article.querySelector('[data-testid="card.wrapper"]');
-        let cardLink = null;
-        if (cardEl) {
-          const cardAnchor = cardEl.querySelector('a[href]');
-          const cardTitle = cardEl.querySelector('[data-testid="card.layoutLarge.detail"] span, [data-testid="card.layoutSmall.detail"] span');
-          if (cardAnchor) {
-            cardLink = {
-              href: cardAnchor.href,
-              title: cardTitle?.textContent?.trim() || cardAnchor.textContent?.trim() || '',
-            };
-          }
-        }
-
-        // Quote tweet
-        const quoteEl = article.querySelector('[data-testid="quoteTweet"]');
-        let quoteData = null;
-        if (quoteEl) {
-          const quoteText = quoteEl.querySelector('[data-testid="tweetText"]');
-          const quoteName = quoteEl.querySelector('[data-testid="User-Name"]');
-          const quoteTime = quoteEl.querySelector('time');
-          quoteData = {
-            author: quoteName?.textContent?.match(/@(\w+)/)?.[1] || '',
-            text: quoteText?.textContent || '',
-            time: quoteTime?.getAttribute('datetime') || '',
-          };
-        }
-
-        tweetMap.set(statusId, {
-          author: tweetAuthor,
-          text: textEl?.innerHTML || '',
-          time: timeEl?.getAttribute('datetime') || '',
-          images,
-          cardLink,
-          quoteData,
-        });
-        newCount++;
-      }
-      return newCount;
-    }
-
-    // Initial harvest before scrolling
-    harvestVisibleTweets();
-
-    // Scroll loop with MutationObserver for efficient wait
-    let consecutiveEmptyScrolls = 0;
-
-    for (let i = 0; i < MAX_SCROLL_ITERATIONS; i++) {
-      const sizeBefore = tweetMap.size;
-
-      window.scrollBy(0, window.innerHeight);
-
-      // Wait for DOM mutations (new tweets rendered) or timeout
-      await new Promise((resolve) => {
-        let resolved = false;
-        const done = () => {
-          if (resolved) return;
-          resolved = true;
-          observer.disconnect();
-          resolve();
-        };
-        const observer = new MutationObserver(done);
-        const section = document.querySelector('section[role="region"]');
-        if (section) {
-          observer.observe(section, { childList: true, subtree: true });
-        }
-        setTimeout(done, SCROLL_WAIT_MS);
-      });
-
-      harvestVisibleTweets();
-
-      if (tweetMap.size === sizeBefore) {
-        consecutiveEmptyScrolls++;
-        if (consecutiveEmptyScrolls >= 2) break;
-      } else {
-        consecutiveEmptyScrolls = 0;
-      }
-    }
-
-    // Restore scroll position
-    window.scrollTo(0, savedScrollY);
-
-    // --- Phase 3: Filter and assemble ---
-
-    const threadAuthorLower = threadAuthor.toLowerCase();
-    const threadTweets = Array.from(tweetMap.entries())
-      .filter(([_, data]) => data.author.toLowerCase() === threadAuthorLower)
-      .sort((a, b) => new Date(a[1].time) - new Date(b[1].time));
-
-    if (threadTweets.length === 0) return null;
-
-    // Build semantic HTML for Turndown
-    const article = document.createElement('article');
-
-    // Header
-    const header = document.createElement('p');
-    const firstTime = threadTweets[0][1].time;
-    const dateStr = firstTime
-      ? new Date(firstTime).toLocaleDateString('en-US', {
-          month: 'short',
-          day: 'numeric',
-          year: 'numeric',
-        })
-      : '';
-    header.innerHTML =
-      '<strong>Thread by @' + threadAuthor + '</strong>' + (dateStr ? ' \u00b7 ' + dateStr : '');
-    article.appendChild(header);
-    article.appendChild(document.createElement('hr'));
-
-    let prevTime = null;
-    for (const [statusId, tweet] of threadTweets) {
-      // Time-gap separator (>3h between consecutive tweets)
-      if (prevTime && tweet.time) {
-        const gap = new Date(tweet.time) - new Date(prevTime);
-        if (gap > TIME_GAP_SEPARATOR_MS) {
-          article.appendChild(document.createElement('hr'));
-        }
-      }
-
-      const p = document.createElement('p');
-      const tempDiv = document.createElement('div');
-      tempDiv.innerHTML = tweet.text;
-      p.appendChild(window.ClipMD.flattenInline(tempDiv));
-      article.appendChild(p);
-
-      // Images
-      for (const imgSrc of tweet.images) {
-        const img = document.createElement('img');
-        img.src = imgSrc;
-        img.alt = '';
-        article.appendChild(img);
-      }
-
-      // Card link (external URL preview)
-      if (tweet.cardLink) {
-        const linkP = document.createElement('p');
-        const a = document.createElement('a');
-        a.href = tweet.cardLink.href;
-        a.textContent = tweet.cardLink.title || tweet.cardLink.href;
-        linkP.appendChild(a);
-        article.appendChild(linkP);
-      }
-
-      // Quote tweet as blockquote
-      if (tweet.quoteData) {
-        const bq = document.createElement('blockquote');
-        const qHeader = document.createElement('p');
-        qHeader.innerHTML = '<strong>@' + tweet.quoteData.author + '</strong>';
-        bq.appendChild(qHeader);
-        const qText = document.createElement('p');
-        qText.textContent = tweet.quoteData.text;
-        bq.appendChild(qText);
-        article.appendChild(bq);
-      }
-
-      prevTime = tweet.time;
-    }
+    const sections = [];
+    if (context.length) sections.push(T.tag('context', {}, T.join(context.map((t) => renderTweet(t, warnings)))));
+    sections.push(...thread.map((t) => renderTweet(t, warnings)));
 
     return {
-      title: 'Thread by @' + threadAuthor,
-      author: '@' + threadAuthor,
-      date: threadTweets[0][1].time?.split('T')[0] || window.ClipMD.todayISO(),
-      type: 'twitter-thread',
-      url: window.ClipMD.getCanonicalUrl(),
-      meta: { tweet_count: threadTweets.length },
-      content: article,
+      meta: {
+        title: `Thread by @${handle}`,
+        url: `https://x.com/${handle}/status/${thread[0].rest_id}`,
+        author: '@' + handle,
+        date: ClipMD.isoDate(isoTime(thread[0])),
+        type: 'twitter-thread',
+        tweet_count: thread.length,
+        context_tweets: context.length || undefined,
+      },
+      markdown: T.join(sections),
+      warnings,
     };
   },
 };

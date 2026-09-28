@@ -1,0 +1,14 @@
+{
+  "name": "clip-md",
+  "private": true,
+  "type": "module",
+  "description": "Dev-only tooling for the clip.md extension (the extension itself has no build step).",
+  "scripts": {
+    "test": "node --test tests/",
+    "check-clip": "node tools/check-clip.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.1",
+    "yaml": "^2.9.1"
+  }
+}
